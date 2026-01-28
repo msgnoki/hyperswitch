@@ -1,0 +1,130 @@
+version: "3.8"
+
+volumes:
+  pg_data:
+  redisinsight_store:
+
+networks:
+  router_net:
+
+services:
+  prestart-hook:
+    image: docker.io/curlimages/curl-base:latest
+    container_name: prestart-hook
+    environment:
+      - ONE_CLICK_SETUP=${ONE_CLICK_SETUP:-false}
+    entrypoint:
+      ["/bin/sh", "-c", "apk add --no-cache bash && /bin/bash /prestart_hook.sh"]
+    volumes:
+      - ./scripts/prestart_hook.sh:/prestart_hook.sh
+    networks:
+      - router_net
+
+  pg:
+    image: docker.io/postgres:latest
+    ports:
+      - "15432:5432"
+    networks:
+      - router_net
+    volumes:
+      - pg_data:/var/lib/postgresql
+    environment:
+      - POSTGRES_USER=db_user
+      - POSTGRES_PASSWORD=db_pass
+      - POSTGRES_DB=hyperswitch_db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      interval: 5s
+      retries: 3
+      start_period: 5s
+      timeout: 5s
+
+  redis-standalone:
+    image: docker.io/redis:7
+    networks:
+      - router_net
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep '^PONG$'"]
+      interval: 5s
+      retries: 3
+      start_period: 5s
+      timeout: 5s
+
+  hyperswitch-server:
+    image: docker.juspay.io/juspaydotin/hyperswitch-router:standalone
+    pull_policy: always
+    command: /local/bin/router -f /local/config/docker_compose_local.toml
+    ports:
+      - "18080:8080"
+    networks:
+      - router_net
+    volumes:
+      - ./config:/local/config
+      - ./files:/local/bin/files
+    depends_on:
+      pg:
+        condition: service_healthy
+      redis-standalone:
+        condition: service_healthy
+    labels:
+      logs: "promtail"
+    healthcheck:
+      test: curl --fail http://localhost:8080/health || exit 1
+      interval: 5s
+      retries: 3
+      start_period: 5s
+      timeout: 5s
+
+  hyperswitch-control-center:
+    image: docker.juspay.io/juspaydotin/hyperswitch-control-center:latest
+    pull_policy: always
+    ports:
+      - "9000:9000"
+    environment:
+      - configPath=/tmp/dashboard-config.toml
+      - themeConfigPath=/tmp/dashboard-theme.json
+    volumes:
+      - ./config/dashboard_poc.toml:/tmp/dashboard-config.toml
+      - ./config/dashboard_theme.json:/tmp/dashboard-theme.json
+    depends_on:
+      hyperswitch-server:
+        condition: service_healthy
+    labels:
+      logs: "promtail"
+    networks:
+      - router_net
+
+  create-default-user:
+    image: docker.io/curlimages/curl-base:latest
+    container_name: create-default-user
+    depends_on:
+      hyperswitch-server:
+        condition: service_healthy
+      hyperswitch-control-center:
+        condition: service_started
+    environment:
+      - HYPERSWITCH_SERVER_URL=http://hyperswitch-server:8080
+      - HYPERSWITCH_CONTROL_CENTER_URL=http://hyperswitch-control-center:9000
+    entrypoint:
+      ["/bin/sh", "-c", "apk add --no-cache bash jq && /bin/bash /create_default_user.sh"]
+    volumes:
+      - ./scripts/create_default_user.sh:/create_default_user.sh
+    networks:
+      - router_net
+
+  poststart-hook:
+    image: docker.io/curlimages/curl-base:latest
+    container_name: poststart-hook
+    depends_on:
+      hyperswitch-server:
+        condition: service_healthy
+    environment:
+      - ONE_CLICK_SETUP=${ONE_CLICK_SETUP:-false}
+    entrypoint:
+      ["/bin/sh", "-c", "apk add --no-cache bash jq && /bin/bash /poststart_hook.sh"]
+    volumes:
+      - ./scripts/poststart_hook.sh:/poststart_hook.sh
+    networks:
+      - router_net
